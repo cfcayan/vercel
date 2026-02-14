@@ -1,9 +1,15 @@
 import output from '../../output-manager';
 import type Client from '../../util/client';
-import { execSync } from 'child_process';
+import { existsSync } from 'fs';
+import { execFileSync } from 'child_process';
+import type { ExecFileSyncOptions } from 'child_process';
 import { getLinkedProject } from '../../util/projects/link';
 
 const MCP_ENDPOINT = 'https://mcp.vercel.com';
+
+type ExecResult =
+  | { ok: true; stdout: string }
+  | { ok: false; error: string; stderr: string };
 
 function getAvailableClients(): string[] {
   return [
@@ -14,18 +20,44 @@ function getAvailableClients(): string[] {
   ];
 }
 
-function safeExecSync(
-  command: string,
-  options: any = {}
-): string | { error: string; stderr: string } {
+function safeExecFileSync(
+  file: string,
+  args: string[],
+  options: ExecFileSyncOptions = {}
+): ExecResult {
   try {
-    return execSync(command, {
+    const stdout = execFileSync(file, args, {
       stdio: 'pipe',
       encoding: 'utf8',
       ...options,
     });
-  } catch (error: any) {
-    return { error: error.message, stderr: error.stderr?.toString() || '' };
+
+    return { ok: true, stdout };
+  } catch (error: unknown) {
+    if (error instanceof Error) {
+      const stderr = (error as Error & { stderr?: Buffer | string }).stderr;
+      return {
+        ok: false,
+        error: error.message,
+        stderr: typeof stderr === 'string' ? stderr : stderr?.toString() || '',
+      };
+    }
+
+    return {
+      ok: false,
+      error: 'Unknown command execution error',
+      stderr: '',
+    };
+  }
+}
+
+function openUrl(oneClickUrl: string) {
+  if (process.platform === 'darwin') {
+    execFileSync('open', [oneClickUrl], { stdio: 'ignore' });
+  } else if (process.platform === 'win32') {
+    execFileSync('cmd', ['/c', 'start', '', oneClickUrl], { stdio: 'ignore' });
+  } else {
+    execFileSync('xdg-open', [oneClickUrl], { stdio: 'ignore' });
   }
 }
 
@@ -48,7 +80,7 @@ async function getProjectSpecificUrl(
       url: `${MCP_ENDPOINT}/${org.slug}/${project.name}`,
       projectName: project.name,
     };
-  } catch (error) {
+  } catch (_error) {
     return null;
   }
 }
@@ -56,13 +88,14 @@ async function getProjectSpecificUrl(
 export default async function mcp(client: Client) {
   output.print('🚀 Vercel MCP Setup — Automated\n');
 
-  // Check if --project flag is used
   const isProjectSpecific = client.argv.includes('--project');
+  const projectInfo = isProjectSpecific
+    ? await getProjectSpecificUrl(client)
+    : null;
 
   if (isProjectSpecific) {
     output.print('🔗 Setting up project-specific MCP access...\n');
 
-    const projectInfo = await getProjectSpecificUrl(client);
     if (!projectInfo) {
       output.print(
         '❌ No linked project found. Please link your project first:\n'
@@ -100,19 +133,22 @@ export default async function mcp(client: Client) {
     output.print(`🔧 Setting up ${clientName}...\n`);
 
     if (clientName === 'Claude Code') {
-      const mcpUrl = isProjectSpecific
-        ? (await getProjectSpecificUrl(client))?.url
-        : MCP_ENDPOINT;
-      const mcpName = isProjectSpecific
-        ? `vercel-${(await getProjectSpecificUrl(client))?.projectName}`
+      const mcpUrl = projectInfo?.url || MCP_ENDPOINT;
+      const mcpName = projectInfo
+        ? `vercel-${projectInfo.projectName}`
         : 'vercel';
 
-      const result = safeExecSync(
-        `claude mcp add --transport http ${mcpName} ${mcpUrl}`
-      );
+      const result = safeExecFileSync('claude', [
+        'mcp',
+        'add',
+        '--transport',
+        'http',
+        mcpName,
+        mcpUrl,
+      ]);
 
-      if (typeof result === 'object' && 'error' in result) {
-        if (result.stderr?.includes('already exists')) {
+      if (!result.ok) {
+        if (result.stderr.includes('already exists')) {
           summary.push('✅ Claude Code: Vercel MCP already configured');
           output.print('ℹ️  Vercel MCP is already configured in Claude Code\n');
           output.print('─'.repeat(50) + '\n');
@@ -144,11 +180,9 @@ export default async function mcp(client: Client) {
         '   2. Navigate to Connectors and select Add custom connector\n'
       );
       output.print('   3. Configure the connector:\n');
-      if (isProjectSpecific) {
-        const projectInfo = await getProjectSpecificUrl(client);
-        const projectName = projectInfo?.projectName || 'project';
-        output.print(`      • Name: Vercel ${projectName}\n`);
-        output.print(`      • URL: ${projectInfo?.url}\n`);
+      if (projectInfo) {
+        output.print(`      • Name: Vercel ${projectInfo.projectName}\n`);
+        output.print(`      • URL: ${projectInfo.url}\n`);
       } else {
         output.print('      • Name: Vercel\n');
         output.print(`      • URL: ${MCP_ENDPOINT}\n`);
@@ -157,16 +191,17 @@ export default async function mcp(client: Client) {
       summary.push('ℹ️  Claude.ai/Desktop: Manual setup required');
       output.print('─'.repeat(50) + '\n');
     } else if (clientName === 'Cursor') {
-      // Check if Cursor is installed
-      const cursorCheck = safeExecSync(
+      const cursorCheck =
         process.platform === 'darwin'
-          ? 'ls /Applications/Cursor.app'
-          : process.platform === 'win32'
-            ? 'where cursor'
-            : 'which cursor'
-      );
+          ? existsSync('/Applications/Cursor.app')
+          : safeExecFileSync(process.platform === 'win32' ? 'where' : 'which', [
+              'cursor',
+            ]);
 
-      if (typeof cursorCheck === 'object' && 'error' in cursorCheck) {
+      if (
+        cursorCheck === false ||
+        (typeof cursorCheck !== 'boolean' && !cursorCheck.ok)
+      ) {
         output.print('⚠️ Cursor not detected. Please install Cursor first.\n');
         output.print('   Download from: https://cursor.sh\n');
         output.print('\n');
@@ -175,14 +210,11 @@ export default async function mcp(client: Client) {
         continue;
       }
 
-      const mcpUrl = isProjectSpecific
-        ? (await getProjectSpecificUrl(client))?.url
-        : MCP_ENDPOINT;
-      const serverName = isProjectSpecific
-        ? `vercel-${(await getProjectSpecificUrl(client))?.projectName}`
+      const mcpUrl = projectInfo?.url || MCP_ENDPOINT;
+      const serverName = projectInfo
+        ? `vercel-${projectInfo.projectName}`
         : 'vercel';
 
-      // Check if Vercel MCP is already configured in Cursor
       const cursorConfigPath =
         process.platform === 'darwin'
           ? `${process.env.HOME}/Library/Application Support/Cursor/User/settings.json`
@@ -201,7 +233,6 @@ export default async function mcp(client: Client) {
       try {
         const fs = require('fs');
 
-        // Check ~/.cursor/mcp.json first (Cursor's primary MCP config file)
         if (fs.existsSync(cursorMcpPath)) {
           const configContent = fs.readFileSync(cursorMcpPath, 'utf8');
           const config = JSON.parse(configContent);
@@ -212,7 +243,6 @@ export default async function mcp(client: Client) {
           );
         }
 
-        // Check settings.json if mcp.json doesn't exist or doesn't have the server
         if (!cursorAlreadyConfigured && fs.existsSync(cursorConfigPath)) {
           const configContent = fs.readFileSync(cursorConfigPath, 'utf8');
           const config = JSON.parse(configContent);
@@ -222,7 +252,7 @@ export default async function mcp(client: Client) {
               server.url === mcpUrl || server.url === MCP_ENDPOINT
           );
         }
-      } catch (error) {
+      } catch (_error) {
         // If we can't read the config, assume it's not configured
       }
 
@@ -233,7 +263,6 @@ export default async function mcp(client: Client) {
         continue;
       }
 
-      // Create the one-click installer URL
       const config = {
         url: mcpUrl,
         name: serverName,
@@ -242,19 +271,12 @@ export default async function mcp(client: Client) {
       const encodedConfig = Buffer.from(configJson).toString('base64');
       const oneClickUrl = `cursor://anysphere.cursor-deeplink/mcp/install?name=${serverName}&config=${encodedConfig}`;
 
-      // Try to open the one-click installer
       try {
-        if (process.platform === 'darwin') {
-          execSync(`open '${oneClickUrl}'`);
-        } else if (process.platform === 'win32') {
-          execSync(`start ${oneClickUrl}`);
-        } else {
-          execSync(`xdg-open '${oneClickUrl}'`);
-        }
+        openUrl(oneClickUrl);
 
         summary.push('✅ Cursor: One-click installer opened');
         output.print('ℹ️  Follow the prompts in Cursor to complete setup\n');
-      } catch (error) {
+      } catch (_error) {
         summary.push('⚠️ Cursor: Deep link may not have worked');
         output.print('⚠️ Could not open Cursor automatically\n');
         output.print('💡 Manual setup:\n');
@@ -271,12 +293,11 @@ export default async function mcp(client: Client) {
         output.print('─'.repeat(50) + '\n');
       }
     } else if (clientName === 'VS Code with Copilot') {
-      // Check if GitHub Copilot is installed
-      const copilotCheck = safeExecSync(
-        'code --list-extensions | grep -i copilot'
-      );
+      const copilotCheck = safeExecFileSync('code', ['--list-extensions']);
+      const hasCopilot =
+        copilotCheck.ok && /copilot/i.test(copilotCheck.stdout);
 
-      if (typeof copilotCheck === 'object' && 'error' in copilotCheck) {
+      if (!hasCopilot) {
         output.print(
           '⚠️ GitHub Copilot not detected. MCP functionality may be limited.\n'
         );
@@ -290,14 +311,11 @@ export default async function mcp(client: Client) {
         output.print('\n');
       }
 
-      const mcpUrl = isProjectSpecific
-        ? (await getProjectSpecificUrl(client))?.url
-        : MCP_ENDPOINT;
-      const serverName = isProjectSpecific
-        ? `vercel-${(await getProjectSpecificUrl(client))?.projectName}`
+      const mcpUrl = projectInfo?.url || MCP_ENDPOINT;
+      const serverName = projectInfo
+        ? `vercel-${projectInfo.projectName}`
         : 'vercel';
 
-      // Check if Vercel MCP is already configured in VS Code
       const vscodeConfigPath =
         process.platform === 'darwin'
           ? `${process.env.HOME}/Library/Application Support/Code/User/settings.json`
@@ -316,7 +334,6 @@ export default async function mcp(client: Client) {
       try {
         const fs = require('fs');
 
-        // Check mcp.json first (primary MCP config file)
         if (fs.existsSync(vscodeMcpPath)) {
           const configContent = fs.readFileSync(vscodeMcpPath, 'utf8');
           const config = JSON.parse(configContent);
@@ -327,7 +344,6 @@ export default async function mcp(client: Client) {
           );
         }
 
-        // Check settings.json if mcp.json doesn't exist or doesn't have the server
         if (!vscodeAlreadyConfigured && fs.existsSync(vscodeConfigPath)) {
           const configContent = fs.readFileSync(vscodeConfigPath, 'utf8');
           const config = JSON.parse(configContent);
@@ -337,7 +353,7 @@ export default async function mcp(client: Client) {
               server.url === mcpUrl || server.url === MCP_ENDPOINT
           );
         }
-      } catch (error) {
+      } catch (_error) {
         // If we can't read the config, assume it's not configured
       }
 
@@ -348,7 +364,6 @@ export default async function mcp(client: Client) {
         continue;
       }
 
-      // Create the one-click installer URL
       const config = {
         name: serverName,
         url: mcpUrl,
@@ -357,18 +372,11 @@ export default async function mcp(client: Client) {
       const oneClickUrl = `vscode:mcp/install?${encodedConfig}`;
 
       try {
-        // Try to open the one-click installer
-        if (process.platform === 'darwin') {
-          execSync(`open '${oneClickUrl}'`);
-        } else if (process.platform === 'win32') {
-          execSync(`start ${oneClickUrl}`);
-        } else {
-          execSync(`xdg-open '${oneClickUrl}'`);
-        }
+        openUrl(oneClickUrl);
 
         summary.push('✅ VS Code: One-click installer opened');
         output.print('ℹ️  Follow the prompts in VS Code to complete setup\n');
-      } catch (error) {
+      } catch (_error) {
         summary.push('❌ VS Code: Failed to open one-click installer');
         output.print('💡 Manual setup instructions:\n');
         output.print('   1. Open VS Code\n');
